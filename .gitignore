@@ -1,0 +1,12 @@
+# 运行时产物（消息与成员档案）
+rooms/
+agents/
+view/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 备份
+*.bak
+*.bak.*
