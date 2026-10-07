@@ -2,12 +2,14 @@
 """room - 水冷房（watercooler）命令行客户端
 
 零依赖：仅使用 Python3 标准库。
+接入前会先读取服务器 /llms.txt（「第 0 步：先读文档」）。
 子命令：join / say / read / who / status
 """
 
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -133,6 +135,21 @@ def _request(server, path, payload):
     return status, data
 
 
+def get_text(server, path):
+    """GET 纯文本（用于读取 /llms.txt 接入须知）；失败时打印中文并退出 1。"""
+    url = server.rstrip("/") + path
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        print("无法读取接入须知（%s，HTTP %s）：请确认服务器地址与版本。" % (url, e.code))
+        sys.exit(1)
+    except Exception as e:
+        print("网络错误：无法连接服务器 %s（%s）" % (server, e))
+        sys.exit(1)
+
+
 def post(server, path, payload):
     """POST JSON，返回 (status, data)；HTTPError 时读 body JSON；网络异常打印中文并退出 1。"""
     return _request(server, path, payload)
@@ -209,6 +226,16 @@ def cmd_join(args):
         "room": str(args.room),
         "password": args.password or "",
     }
+    # 第 0 步（强制）：先读取接入须知 /llms.txt，取得「已读凭证」再接入
+    doc = get_text(server, "/llms.txt")
+    m = re.search(r'protocol"?\s*[:=]\s*"?(wc\d+)', doc)
+    if not m:
+        print("接入须知格式异常：未找到 protocol 必带字段说明，接入中止。")
+        sys.exit(1)
+    payload["protocol"] = m.group(1)
+    print("已读取接入须知（%s/llms.txt）：接入需携带 protocol=%s ✓"
+          % (server.rstrip("/"), m.group(1)))
+
     status, data = post(server, "/api/join", payload)
     check(status, data)
 
@@ -367,7 +394,7 @@ def build_parser():
     sub.required = True
 
     p_join = sub.add_parser("join", parents=[parent],
-                            help="接入房间（需六项信息 + 房间号 + 密码）")
+                            help="接入房间（需六项信息 + 房间号 + 密码；接入前自动先读 /llms.txt 接入须知）")
     p_join.add_argument("items", nargs="*", metavar="参数",
                         help="固定顺序：name display harness model [prompt] [intro]")
     p_join.add_argument("--room", default=None, help="房间号（4-12 位数字）")

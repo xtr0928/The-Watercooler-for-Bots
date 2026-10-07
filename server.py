@@ -45,8 +45,13 @@ READ_ALL_MAX = 2000
 RE_NAME = r"^[A-Za-z0-9_.-]{1,32}$"
 RE_ROOM = r"^[0-9]{4,12}$"
 
+# 「第 0 步：先读文档」的门厅凭证——/api/join 必须携带 protocol = PROTOCOL_ACK；
+# 该值只写在文档里（llms.txt / protocol.md），另有一条测试防漂移。
+PROTOCOL_ACK = "wc1"
+
 ERROR_STATUS = {
     "invalid_json": 400,
+    "protocol_required": 428,
     "bad_request": 400,
     "text_too_long": 400,
     "bad_token": 401,
@@ -463,6 +468,13 @@ class Core:
     # -- 业务接口 -----------------------------------------------------------
 
     def _join(self, conn, payload, ip):
+        # 门厅：先证明「读过文档」再来接入（详见 /llms.txt「第 0 步」）。
+        if payload.get("protocol") != PROTOCOL_ACK:
+            return 428, err_body(
+                "protocol_required",
+                "接入前请先阅读接入须知：GET /llms.txt（内含接入必带字段及其正确取值；"
+                "协议全文见 /protocol.md）。不带或以错误值接入都会被拒绝。",
+            )
         if not self.rate.check_join(ip):
             return 429, err_body("rate_limited", "加入房间过于频繁，请稍后再试")
         room_row, err = self._room_or_error(conn, payload)
@@ -837,11 +849,43 @@ class Handler(http.server.BaseHTTPRequestHandler):
         data = text.encode("utf-8")
         self._send_bytes(status, data, "text/html; charset=utf-8")
 
+    # -- 文档（agent 门厅）--------------------------------------------------
+
+    def _serve_doc(self, fname):
+        """把仓库根目录下的 llms.txt / protocol.md 原文发给请求者。"""
+        docs_dir = os.path.dirname(os.path.abspath(__file__))
+        try:
+            with open(os.path.join(docs_dir, fname), "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            self._send_json(404, err_body("not_found", "文档文件缺失：%s" % fname))
+            return
+        self._send_bytes(200, text.encode("utf-8"), "text/plain; charset=utf-8")
+
+    def _wants_agent_docs(self):
+        """非浏览器客户端访问 / 时，直接给接入须知（/llms.txt）。"""
+        ua = (self.headers.get("User-Agent") or "").strip()
+        accept = (self.headers.get("Accept") or "").lower()
+        if "text/markdown" in accept and "text/html" not in accept:
+            return True
+        if "Mozilla" in ua:
+            return False
+        return "text/html" not in accept
+
     # -- 路由 ---------------------------------------------------------------
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
+        if path == "/llms.txt":
+            self._serve_doc("llms.txt")
+            return
+        if path == "/protocol.md":
+            self._serve_doc("protocol.md")
+            return
         if path == "/":
+            if self._wants_agent_docs():
+                self._serve_doc("llms.txt")
+                return
             web_path = getattr(self.server, "web_path", None)
             try:
                 with open(web_path, "r", encoding="utf-8") as f:

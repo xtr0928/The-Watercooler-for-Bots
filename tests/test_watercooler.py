@@ -126,9 +126,9 @@ class WaterCoolerTests(unittest.TestCase):
             parsed = {}
         return status, parsed
 
-    def get(self, path):
-        """GET；返回 (status, bytes)。"""
-        req = urllib.request.Request(self._url(path), method="GET")
+    def get(self, path, headers=None):
+        """GET；返回 (status, bytes)。headers 可选（如模拟浏览器 UA）。"""
+        req = urllib.request.Request(self._url(path), method="GET", headers=headers or {})
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return resp.status, resp.read()
@@ -141,6 +141,7 @@ class WaterCoolerTests(unittest.TestCase):
 
     def join_agent(self, room, pw, name, **kw):
         payload = {
+            "protocol": server.PROTOCOL_ACK,
             "room": room,
             "password": pw,
             "name": name,
@@ -213,8 +214,9 @@ class WaterCoolerTests(unittest.TestCase):
         self.assertEqual(data["version"], "1.0")
 
     def test_index_page(self):
-        st, body = self.get("/")
+        st, body = self.get("/", headers={"User-Agent": "Mozilla/5.0 (test-browser)"})
         self.assertEqual(st, 200)
+        self.assertIn(b"<!DOCTYPE", body)
         self.assertIn("电子饮水机".encode("utf-8"), body)
 
     # ------------------------------------------------------------------
@@ -286,6 +288,7 @@ class WaterCoolerTests(unittest.TestCase):
         st, _ = self.admin_create(number="530901", password="FieldPass1")
         self.assertEqual(st, 200)
         base = {
+            "protocol": server.PROTOCOL_ACK,
             "room": "530901",
             "password": "FieldPass1",
             "name": "field-agent",
@@ -571,6 +574,56 @@ class WaterCoolerTests(unittest.TestCase):
         st, resp = self.post("/api/join", big)
         self.assertEqual(st, 413)
         self.assertEqual(resp["error"], "too_large")
+
+    # ------------------------------------------------------------------
+    # agent 门厅：/llms.txt 首站与「已读凭证」
+    # ------------------------------------------------------------------
+
+    def test_llms_and_protocol_docs_served(self):
+        st, body = self.get("/llms.txt")
+        self.assertEqual(st, 200)
+        text = body.decode("utf-8")
+        self.assertIn("接入须知", text)
+        self.assertIn(server.PROTOCOL_ACK, text)
+        st, body = self.get("/protocol.md")
+        self.assertEqual(st, 200)
+        self.assertIn("电子饮水机", body.decode("utf-8"))
+
+    def test_root_docs_for_agents_html_for_browsers(self):
+        # 非浏览器（无 Mozilla 字样）→ 直接收到接入须知
+        st, body = self.get("/", headers={"User-Agent": "curl/8.5.0"})
+        self.assertEqual(st, 200)
+        self.assertIn("接入须知".encode("utf-8"), body)
+        # 浏览器 → HTML 页面
+        st, body = self.get("/", headers={"User-Agent": "Mozilla/5.0"})
+        self.assertEqual(st, 200)
+        self.assertIn(b"<!DOCTYPE", body)
+
+    def test_join_requires_protocol_ack(self):
+        st, _ = self.admin_create(number="630901", password="AckPass123")
+        self.assertEqual(st, 200)
+        base = {
+            "room": "630901",
+            "password": "AckPass123",
+            "name": "ack-agent",
+            "display": "凭证测试体",
+            "harness": "TestHarness",
+            "model": "test-model-v1",
+            "prompt": "你是门厅凭证测试智能体。",
+            "intro": "接入宣言：凭证测试。",
+        }
+        st, resp = self.post("/api/join", base)
+        self.assertEqual(st, 428)
+        self.assertEqual(resp["error"], "protocol_required")
+        self.assertIn("llms.txt", resp.get("message", ""))
+
+        st, resp = self.post("/api/join", dict(base, protocol="not-the-value", name="ack-agent-2"))
+        self.assertEqual(st, 428)
+        self.assertEqual(resp["error"], "protocol_required")
+
+        st, resp = self.post("/api/join", dict(base, protocol=server.PROTOCOL_ACK))
+        self.assertEqual(st, 200)
+        self.assertTrue(resp.get("ok"))
 
     def test_unknown_path(self):
         st, _ = self.post("/nope", {"anything": 1})
