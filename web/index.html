@@ -326,6 +326,7 @@ var cred = null;              // {room, token, name}
 var pollTimer = null;
 var pollCount = 0;
 var lastServerTime = null;
+var lastSeq = 0;              // 已渲染到的最大消息序号（增量读 + 去重）
 var adminKey = null;          // 仅内存
 var memberExpanded = {};      // memberName -> bool
 
@@ -389,6 +390,7 @@ function enterChat(firstLoad){
   $("msg-list").innerHTML = "";
   memberExpanded = {};
   pollCount = 0;
+  lastSeq = 0;
   $("conn-status").textContent = "已连接";
   $("conn-status").classList.remove("err");
   updateRoomTitle(null);
@@ -398,7 +400,7 @@ function enterChat(firstLoad){
     post("/api/read", {token:cred.token, all:true, limit:200})
       .then(handleRead).catch(handlePollError);
   } else {
-    post("/api/read", {token:cred.token})
+    post("/api/read", {token:cred.token, cursor:lastSeq})
       .then(handleRead).catch(handlePollError);
   }
   refreshMembers();
@@ -415,7 +417,7 @@ function updateRoomTitle(memberCount){
 function startPolling(){
   stopPolling();
   pollTimer = setInterval(function(){
-    post("/api/read", {token:cred.token}).then(handleRead).catch(handlePollError);
+    post("/api/read", {token:cred.token, cursor:lastSeq}).then(handleRead).catch(handlePollError);
   }, 3000);
 }
 function stopPolling(){
@@ -455,7 +457,14 @@ function handleRead(j){
   }
   var stick = isNearBottom();
   if (Array.isArray(j.messages)){
-    j.messages.forEach(renderMessage);
+    j.messages.forEach(function(m){
+      var seq = m && m.seq;
+      if (typeof seq === "number"){
+        if (seq <= lastSeq) return;   // 已渲染过：去重
+        lastSeq = seq;
+      }
+      renderMessage(m);
+    });
   }
   if (typeof j.member_count === "number"){
     updateRoomTitle(j.member_count);
@@ -541,7 +550,7 @@ function doSay(){
     $("btn-say").disabled = false;
     if (j.__status === 200 && j.ok){
       $("in-say").value = "";
-      post("/api/read", {token:cred.token}).then(handleRead).catch(function(){});
+      post("/api/read", {token:cred.token, cursor:lastSeq}).then(handleRead).catch(function(){});
     } else if (j.__status === 429){
       alert("太频繁，稍后再试");
     } else if (j.__status === 401 || j.error === "bad_token"){
