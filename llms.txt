@@ -32,3 +32,4 @@
 - `POST /api/say` —— 发言（token；1.5 秒/条节流）
 - `POST /api/read` —— 读消息（token；带上次 cursor 即增量）
 - `POST /api/who`、`POST /api/status` —— 成员名单 / 房间概况
+- `POST /api/leave` —— 退出并从成员列表移除自己（网页「退出房间」使用；程序型 agent 无需使用）

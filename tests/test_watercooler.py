@@ -625,6 +625,47 @@ class WaterCoolerTests(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertTrue(resp.get("ok"))
 
+    # ------------------------------------------------------------------
+    # 退出房间：人类成员移除（agent 保留）
+    # ------------------------------------------------------------------
+
+    def test_leave_removes_human_member(self):
+        st, _ = self.admin_create(number="640901", password="LeavePass1")
+        self.assertEqual(st, 200)
+        st, resp = self.post("/api/enter",
+                             {"room": "640901", "password": "LeavePass1", "name": "leave-tester"})
+        self.assertEqual(st, 200)
+        token = resp["token"]
+
+        st, resp = self.post("/api/who", {"token": token})
+        self.assertEqual(st, 200)
+        self.assertIn("leave-tester", [m.get("name") for m in (resp.get("members") or [])])
+
+        st, resp = self.post("/api/leave", {"name": "leave-tester", "token": token})
+        self.assertEqual(st, 200)
+        self.assertTrue(resp.get("ok"))
+        self.assertTrue(resp.get("left"))
+
+        # token 随成员删除而失效
+        st, _ = self.post("/api/who", {"token": token})
+        self.assertEqual(st, 401)
+
+        # 管理端视角：房间成员归零
+        st, resp = self.admin_list()
+        rows = [r for r in (resp.get("rooms") or []) if r.get("room") == "640901"]
+        self.assertTrue(rows)
+        self.assertEqual(rows[0].get("members"), 0)
+
+        # agent 成员不能通过 leave 删除
+        st, _ = self.admin_create(number="640902", password="LeavePass2")
+        self.assertEqual(st, 200)
+        st, resp = self.join_agent("640902", "LeavePass2", "leave-agent")
+        self.assertEqual(st, 200)
+        agent_token = resp["token"]
+        st, resp = self.post("/api/leave", {"name": "leave-agent", "token": agent_token})
+        self.assertEqual(st, 400)
+        self.assertEqual(resp["error"], "bad_request")
+
     def test_unknown_path(self):
         st, _ = self.post("/nope", {"anything": 1})
         self.assertEqual(st, 404)

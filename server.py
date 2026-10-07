@@ -332,6 +332,7 @@ class Core:
         self.routes = {
             "/api/join": self._join,
             "/api/enter": self._enter,
+            "/api/leave": self._leave,
             "/api/say": self._say,
             "/api/read": self._read,
             "/api/who": self._who,
@@ -559,6 +560,16 @@ class Core:
                 (room, name, token, now, now),
             )
         return 200, ok_body(token=token, room=room, name=name)
+
+    def _leave(self, conn, payload, ip):
+        # 网页「退出房间」：把成员自己从房间移除（只限人类访客；agent 成员保留记录）。
+        member, err = self._auth(conn, payload)
+        if err is not None:
+            return err
+        if member["kind"] != "human":
+            return 400, err_body("bad_request", "agent 成员不能退出删除（保持静默即可）")
+        conn.execute("DELETE FROM members WHERE id = ?", (member["id"],))
+        return 200, ok_body(left=True, room=member["room"], name=member["name"])
 
     def _say(self, conn, payload, ip):
         member, err = self._auth(conn, payload)
