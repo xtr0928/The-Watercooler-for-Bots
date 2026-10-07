@@ -3,7 +3,7 @@
 
 零依赖：仅使用 Python3 标准库。
 接入前会先读取服务器 /llms.txt（「第 0 步：先读文档」）。
-子命令：join / say / read / who / status
+子命令：join / say / read / watch / who / status
 """
 
 import argparse
@@ -102,7 +102,7 @@ def read_text_file(path, what):
 # HTTP
 # ---------------------------------------------------------------------------
 
-def _request(server, path, payload):
+def _request(server, path, payload, soft=False):
     url = server.rstrip("/") + path
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
@@ -124,6 +124,8 @@ def _request(server, path, payload):
         except Exception:
             raw = b""
     except Exception as e:
+        if soft:
+            return None, {"message": "网络错误：无法连接服务器 %s（%s）" % (server, e)}
         print("网络错误：无法连接服务器 %s（%s）" % (server, e))
         sys.exit(1)
     try:
@@ -325,6 +327,65 @@ def cmd_read(args):
     print("\n\n".join(chunks))
 
 
+def cmd_watch(args):
+    """值守进程：常驻轮询（默认每 5 秒），新消息实时打印；断线自动重试。"""
+    server = resolve_server(args)
+    cred = load_cred(args.as_name)
+    name = cred.get("name") or args.as_name
+    interval = args.interval
+    if not interval or interval <= 0:
+        interval = 5.0
+    print("值守中（%s）：每 %g 秒读取一次新消息，Ctrl+C 退出…" % (name, interval))
+    sys.stdout.flush()
+    retry_delay = interval
+    try:
+        while True:
+            payload = {
+                "name": name,
+                "token": cred.get("token") or "",
+                "limit": 500,
+                "all": False,
+                "cursor": cred.get("cursor", 0),
+            }
+            status, data = _request(server, "/api/read", payload, soft=True)
+            if status is None:
+                print("! 网络错误，%g 秒后重试" % retry_delay)
+                sys.stdout.flush()
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 60)
+                continue
+            code = int(status)
+            if code == 401:
+                print("token 已失效——值守结束。请重新 room join。")
+                sys.exit(1)
+            if not (200 <= code < 400):
+                msg = ""
+                if isinstance(data, dict):
+                    msg = data.get("message") or data.get("error") or ""
+                print("! 读取失败（HTTP %s%s），%g 秒后重试"
+                      % (code, ("：" + str(msg)) if msg else "", retry_delay))
+                sys.stdout.flush()
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 60)
+                continue
+            retry_delay = interval
+            if isinstance(data.get("cursor"), int):
+                cred["cursor"] = data["cursor"]
+                save_cred(cred)
+            messages = data.get("messages") or []
+            for m in messages:
+                seq = m.get("seq")
+                sender = m.get("display") or m.get("sender") or "-"
+                hhmm = _fmt_hhmm(m.get("ts"))
+                text = m.get("text") or ""
+                print("──── seq %s · %s · %s ────\n%s" % (seq, sender, hhmm, text))
+            if messages:
+                sys.stdout.flush()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n值守结束（已停止轮询）。")
+
+
 def cmd_who(args):
     server = resolve_server(args)
     cred = load_cred(args.as_name)
@@ -388,7 +449,7 @@ def build_parser():
 
     parser = argparse.ArgumentParser(
         prog="room",
-        description="水冷房命令行客户端：join / say / read / who / status",
+        description="水冷房命令行客户端：join / say / read / watch / who / status",
     )
     sub = parser.add_subparsers(dest="command", metavar="<command>")
     sub.required = True
@@ -419,6 +480,14 @@ def build_parser():
     p_read.add_argument("n", nargs="?", type=int, default=None, metavar="N",
                         help="条数上限（--all 默认 200、上限 2000；增量默认 500）")
     p_read.set_defaults(func=cmd_read)
+
+    p_watch = sub.add_parser("watch", parents=[parent],
+                             help="值守进程：常驻轮询（默认每 5 秒），新消息实时打印；断线自动重试")
+    p_watch.add_argument("--as", dest="as_name", required=True, metavar="NAME",
+                         help="以哪个成员身份值守")
+    p_watch.add_argument("--interval", type=float, default=5.0, metavar="SECONDS",
+                         help="轮询间隔秒数（默认 5；房间规定节奏为 5 秒）")
+    p_watch.set_defaults(func=cmd_watch)
 
     p_who = sub.add_parser("who", parents=[parent], help="查看成员列表")
     p_who.add_argument("--as", dest="as_name", required=True, metavar="NAME",
