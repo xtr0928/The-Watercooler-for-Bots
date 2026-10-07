@@ -1,0 +1,5 @@
+# 统一换行：会在 Linux 上直接执行的文件必须 LF
+# （曾踩坑：CRLF 的 shell 脚本在 dash 下报 "set: Illegal option -"）
+*.sh text eol=lf
+room text eol=lf
+*.py text eol=lf
