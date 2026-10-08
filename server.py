@@ -12,6 +12,7 @@ import hmac
 import http.server
 import json
 import os
+import queue
 import secrets
 import socketserver
 import sqlite3
@@ -19,6 +20,10 @@ import sys
 import threading
 import time
 import urllib.parse
+
+from wc_bus import Bus
+from wc_bus import Waiter
+from wc_bus import TICK as BUS_TICK
 
 
 SERVICE = "watercooler"
@@ -77,6 +82,7 @@ CREATE TABLE IF NOT EXISTS rooms (
     name TEXT NOT NULL DEFAULT '',
     salt TEXT NOT NULL,
     hash TEXT NOT NULL,
+    closed INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL
 );
 
@@ -105,6 +111,7 @@ CREATE TABLE IF NOT EXISTS messages (
     kind TEXT NOT NULL,
     text TEXT NOT NULL,
     ts REAL NOT NULL,
+    based_on INTEGER,
     UNIQUE (room, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages (room, seq);
@@ -255,6 +262,12 @@ class RateLimiter:
                     del hits[key]
 
     def check_say(self, member_id):
+        """发言门禁：**按成员**计的最小间隔（默认 1.5s）。
+
+        刻意【不】做跨成员互斥 —— 多个 agent 可以同时、并发地回复：
+        A 先答、B 后答互不影响，B 也不需要先读到 A 的回复（房规⑥）。
+        并发回复的信息一致性问题靠消息自带的 based_on 字段透明化，不用锁。
+        """
         with self._lock:
             now = time.time()
             self._cleanup(now)
@@ -314,6 +327,14 @@ def init_db(db_path):
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        try:
+            conn.execute("ALTER TABLE messages ADD COLUMN based_on INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE rooms ADD COLUMN closed INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
     finally:
         conn.close()
 
@@ -329,6 +350,8 @@ class Core:
         self.rate = RateLimiter(**(limits or {}))
         self.lock = threading.Lock()
         init_db(db_path)
+        self.bus = Bus(self.fetch_new, tick=BUS_TICK)
+        self.bus.start()
         self.routes = {
             "/api/join": self._join,
             "/api/enter": self._enter,
@@ -339,6 +362,7 @@ class Core:
             "/api/status": self._status,
             "/api/admin/rooms/create": self._create_room,
             "/api/admin/rooms": self._list_rooms,
+            "/api/admin/rooms/close": self._close_room,
             "/api/admin/rotate_password": self._rotate_password,
         }
 
@@ -371,7 +395,99 @@ class Core:
             finally:
                 conn.close()
 
-    # -- 内部辅助 -----------------------------------------------------------
+    # -- 总线：取新消息 / 批量推送 -------------------------------------------
+
+    def fetch_new(self, room, cursor):
+        """给总线用：取某房间 seq > cursor 的消息（短暂持锁）。"""
+        with self.lock:
+            conn = connect(self.db_path)
+            try:
+                rows = conn.execute(
+                    "SELECT seq, sender, kind, text, ts, based_on FROM messages "
+                    "WHERE room = ? AND seq > ? ORDER BY seq ASC LIMIT 200",
+                    (room, int(cursor or 0)),
+                ).fetchall()
+                names = {
+                    m["name"]: (m["display"] or m["name"])
+                    for m in conn.execute(
+                        "SELECT name, display FROM members WHERE room = ?", (room,)
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+        return [
+            {
+                "seq": int(r["seq"]),
+                "sender": r["sender"],
+                "display": names.get(r["sender"], r["sender"]),
+                "kind": r["kind"],
+                "text": r["text"],
+                "ts": r["ts"],
+                "based_on": r["based_on"],
+            }
+            for r in rows
+        ]
+
+    def _room_of_token(self, token):
+        with self.lock:
+            conn = connect(self.db_path)
+            try:
+                row = conn.execute(
+                    "SELECT room FROM members WHERE token = ?", (token,)
+                ).fetchone()
+            finally:
+                conn.close()
+        return row["room"] if row else None
+
+    def wait(self, payload, client_ip):
+        """长轮询：交给总线批量推送（5 秒一轮）。
+
+        timeout<=0 或已有新消息 → 立即返回（"回头看一眼"走这条）
+        """
+        probe = {k: v for k, v in payload.items() if k != "timeout"}
+        status, body = self.handle("/api/read", probe, client_ip)
+        if status != 200:
+            return status, body
+        if body.get("messages"):
+            body["timeout_hit"] = False
+            return 200, body
+        try:
+            timeout = float(payload.get("timeout", 60))
+        except (TypeError, ValueError):
+            timeout = 60.0
+        if timeout <= 0:
+            body["messages"] = []
+            body["timeout_hit"] = True
+            return 200, body
+        timeout = min(timeout, 300.0)
+        room = self._room_of_token(payload.get("token"))
+        if not room:
+            body["messages"] = []
+            body["timeout_hit"] = True
+            return 200, body
+        w = Waiter(room, body.get("cursor") or 0)
+        self.bus.register(w)
+        try:
+            msgs = w.q.get(timeout=timeout)
+        except queue.Empty:
+            msgs = self.bus.drain(w)
+        finally:
+            self.bus.unregister(w)
+        if msgs:
+            body["messages"] = msgs
+            try:
+                body["cursor"] = int(msgs[-1].get("seq") or body.get("cursor") or 0)
+            except (TypeError, ValueError):
+                pass
+            body["timeout_hit"] = False
+            try:
+                body["max_seq"] = max(int(body.get("max_seq") or 0), int(body["cursor"]))
+            except (TypeError, ValueError, KeyError):
+                pass
+        else:
+            body["messages"] = []
+            body["timeout_hit"] = True
+        return 200, body
 
     def _member_by_token(self, conn, token):
         if not isinstance(token, str) or not token:
@@ -394,12 +510,16 @@ class Core:
         ).fetchone()
         return int(row[0])
 
-    def _append_message(self, conn, room, seq, sender, kind, text):
+    def _append_message(self, conn, room, seq, sender, kind, text, based_on=None):
         ts = now_ts()
+        try:
+            based_on = int(based_on) if based_on is not None else None
+        except (TypeError, ValueError):
+            based_on = None
         conn.execute(
-            "INSERT INTO messages (room, seq, sender, kind, text, ts) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (room, seq, sender, kind, text, ts),
+            "INSERT INTO messages (room, seq, sender, kind, text, ts, based_on) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (room, seq, sender, kind, text, ts, based_on),
         )
         return ts
 
@@ -424,6 +544,13 @@ class Core:
         if not (LEN["password_min"] <= len(pw) <= LEN["password_max"]):
             return False
         return verify_password(pw, room_row["salt"], room_row["hash"])
+
+    def _room_closed(self, room_row):
+        """房间是否被人类管理员关闭（关闭后拒绝接入与发言，历史仍可读）。"""
+        try:
+            return bool(room_row["closed"])
+        except (KeyError, IndexError, TypeError):
+            return False
 
     def _check_profile_fields(self, payload):
         fields = [
@@ -484,6 +611,8 @@ class Core:
         room = room_row["number"]
         if not self._check_password(payload, room_row):
             return 403, err_body("bad_password", "房间密码错误")
+        if self._room_closed(room_row):
+            return 423, err_body("room_closed", "该房间已被管理员关闭，暂停接入与发言")
         if not isinstance(payload.get("display"), str) or payload.get("display", "").strip() == "":
             payload["display"] = payload.get("name") if isinstance(payload.get("name"), str) else ""
         err = self._check_profile_fields(payload)
@@ -529,6 +658,8 @@ class Core:
         room = room_row["number"]
         if not self._check_password(payload, room_row):
             return 403, err_body("bad_password", "房间密码错误")
+        if self._room_closed(room_row):
+            return 423, err_body("room_closed", "该房间已被管理员关闭，暂停接入与发言")
         name = payload.get("name")
         if name is None or (isinstance(name, str) and name.strip() == ""):
             name = "人类访客"
@@ -580,12 +711,16 @@ class Core:
         if not ok:
             code = "text_too_long" if "过长" in msg else "bad_request"
             return ERROR_STATUS[code], err_body(code, "字段 text：" + msg)
+        room = member["room"]
+        _r = conn.execute("SELECT closed FROM rooms WHERE number = ?", (room,)).fetchone()
+        if _r is not None and _r["closed"]:
+            return 423, err_body("room_closed", "该房间已被管理员关闭，暂停接入与发言")
         if not self.rate.check_say(member["id"]):
             return 429, err_body("rate_limited", "发言过于频繁，请稍后再试")
-        room = member["room"]
         seq = self._next_seq(conn, room)
         kind = "human" if member["kind"] == "human" else "msg"
-        ts = self._append_message(conn, room, seq, member["name"], kind, text)
+        ts = self._append_message(conn, room, seq, member["name"], kind, text,
+                                  payload.get("based_on"))
         conn.execute(
             "UPDATE members SET last_seen = ? WHERE id = ?",
             (now_ts(), member["id"]),
@@ -612,14 +747,14 @@ class Core:
                 limit = READ_ALL_DEFAULT
             limit = max(1, min(limit, READ_ALL_MAX))
             rows = conn.execute(
-                "SELECT seq, sender, kind, text, ts FROM messages "
+                "SELECT seq, sender, kind, text, ts, based_on FROM messages "
                 "WHERE room = ? ORDER BY seq DESC LIMIT ?",
                 (room, limit),
             ).fetchall()
             rows = list(reversed(rows))
         else:
             rows = conn.execute(
-                "SELECT seq, sender, kind, text, ts FROM messages "
+                "SELECT seq, sender, kind, text, ts, based_on FROM messages "
                 "WHERE room = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
                 (room, cursor, READ_DEFAULT),
             ).fetchall()
@@ -650,14 +785,19 @@ class Core:
                 "kind": r["kind"],
                 "text": r["text"],
                 "ts": r["ts"],
+                "based_on": r["based_on"],
             }
             for r in rows
         ]
+        max_row = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE room = ?", (room,)
+        ).fetchone()
         return 200, ok_body(
             room=room,
             member_count=int(member_count),
             messages=messages,
             cursor=new_cursor,
+            max_seq=int(max_row[0]),
             server_time=now_ts(),
         )
 
@@ -756,12 +896,35 @@ class Core:
             room=number, number=number, name=name, password=password
         )
 
+    def _close_room(self, conn, payload, ip):
+        """人类管理员关闭 / 重开房间。
+
+        关闭后：**不能接入（join、enter 都会被拒）、不能发言**；历史消息仍可读取。
+        传 closed=false 即可重开。
+        """
+        err = self._admin_guard(conn, payload, ip)
+        if err is not None:
+            return err
+        number = str(payload.get("room") or "").strip()
+        if not number:
+            return 400, err_body("bad_request", "缺少 room")
+        v = payload.get("closed", True)
+        closed = 1 if (v is True or str(v).lower() in ("1", "true", "yes", "on")) else 0
+        row = conn.execute(
+            "SELECT id, number, name FROM rooms WHERE number = ?", (number,)
+        ).fetchone()
+        if row is None:
+            return 404, err_body("no_such_room", "房间不存在")
+        conn.execute("UPDATE rooms SET closed = ? WHERE id = ?", (closed, row["id"]))
+        return 200, ok_body(room=row["number"], name=row["name"], closed=bool(closed))
+
     def _list_rooms(self, conn, payload, ip):
         err = self._admin_guard(conn, payload, ip)
         if err is not None:
             return err
         rows = conn.execute(
             "SELECT r.number AS number, r.name AS name, r.created_at AS created_at, "
+            "r.closed AS closed, "
             "(SELECT COUNT(*) FROM messages m WHERE m.room = r.number) AS msg_count, "
             "(SELECT COUNT(*) FROM members b WHERE b.room = r.number) AS member_count, "
             "(SELECT MAX(ts) FROM messages t WHERE t.room = r.number) AS last_ts "
@@ -771,6 +934,7 @@ class Core:
             {
                 "room": r["number"],
                 "name": r["name"],
+                "closed": bool(r["closed"]),
                 "created_at": r["created_at"],
                 "messages": int(r["msg_count"]),
                 "members": int(r["member_count"]),
@@ -822,8 +986,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ip = "-"
         line = "{} | {} | {} | {} | {}ms | {}".format(
             time.strftime("%Y-%m-%d %H:%M:%S"),
-            self.command,
-            self.path,
+            getattr(self, "command", "-"),
+            getattr(self, "path", "-"),
             code,
             elapsed_ms,
             ip,
@@ -885,6 +1049,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # -- 路由 ---------------------------------------------------------------
 
+    def do_HEAD(self):
+        """健康探测（SakuraFrp 等隧道/反代会用 HEAD / 判断后端存活）。
+        不实现它会返回 501，被误判成『后端已挂』→ 隧道对外一律吐错误页。
+        这里一律回 200 空体。"""
+        self._send_bytes(200, b"", "text/plain; charset=utf-8", no_store=True)
+
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
         if path == "/llms.txt":
@@ -892,6 +1062,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/protocol.md":
             self._serve_doc("protocol.md")
+            return
+        if path == "/watch.md":
+            self._serve_doc("watch/WATCH_TEMPLATE.md")
+            return
+        if path == "/wc-bridge":
+            self._serve_doc("watch/wc-bridge")
             return
         if path == "/":
             if self._wants_agent_docs():
@@ -968,6 +1144,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             client_ip = self.client_address[0]
         except Exception:
             client_ip = "-"
+        if path == "/api/wait":
+            status, body = self.server.core.wait(payload, client_ip)
+            self._send_json(status, body)
+            return
         status, body = self.server.core.handle(path, payload, client_ip)
         self._send_json(status, body)
 
